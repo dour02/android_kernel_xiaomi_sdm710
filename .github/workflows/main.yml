@@ -1,0 +1,97 @@
+name: grus KernelSU-Next
+
+on:
+  workflow_dispatch:
+
+env:
+  KSU_BRANCH: legacy
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison build-essential curl flex git \
+            libelf-dev libssl-dev lz4 python3 zip cpio device-tree-compiler
+
+      - name: Toolchain
+        run: |
+          git clone --depth=1 https://github.com/kdrag0n/proton-clang $HOME/tc
+          echo "$HOME/tc/bin" >> $GITHUB_PATH
+
+      - name: Integrate KernelSU-Next
+        run: |
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s $KSU_BRANCH
+
+      - name: KSU config fragment
+        run: |
+          printf '%s\n' \
+            CONFIG_KSU=y \
+            CONFIG_KPROBES=y \
+            CONFIG_HAVE_KPROBES=y \
+            CONFIG_KPROBE_EVENTS=y \
+            CONFIG_KSU_KPROBE_HOOKS=y \
+            CONFIG_MODULES=y \
+            > arch/arm64/configs/ksu.config
+
+      - name: Build
+        run: |
+          ARGS="O=out ARCH=arm64 CC=clang LD=ld.lld \
+            CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip"
+          make $ARGS sdm670-perf_defconfig xiaomi/sdm710-common.config xiaomi/grus.config ksu.config
+          grep -E "CONFIG_KSU|CONFIG_KPROBES" out/.config
+          make $ARGS -j$(nproc --all) 2>&1 | tee build.log
+          test -f out/arch/arm64/boot/Image
+
+      - name: Package AnyKernel3
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
+          rm -rf ak3/.git ak3/.github ak3/README.md ak3/modules ak3/patch ak3/ramdisk
+          cp out/arch/arm64/boot/Image ak3/
+
+          cat > ak3/anykernel.sh << 'EOF'
+          ### AnyKernel3 Ramdisk Mod Script
+          properties() { '
+          kernel.string=grus KernelSU-Next
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=grus
+          device.name2=
+          supported.versions=
+          supported.patchlevels=
+          '; }
+
+          BLOCK=/dev/block/bootdevice/by-name/boot;
+          IS_SLOT_DEVICE=0;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          . tools/ak3-core.sh;
+
+          split_boot;
+          flash_boot;
+          EOF
+          sed -i 's/^          //' ak3/anykernel.sh
+
+          cd ak3 && zip -r9 ../grus-KernelSU-Next-$(date +%Y%m%d).zip *
+
+      - name: Upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: grus-ksun
+          path: |
+            grus-KernelSU-Next-*.zip
+            build.log
+            out/.config
