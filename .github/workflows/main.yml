@@ -38,6 +38,23 @@ jobs:
         run: |
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s $KSU_BRANCH
 
+      - name: Fix KernelSU-Next for old kernel_read API (<= 4.13)
+        run: |
+          # 4.9 的 kernel_read 参数顺序是 (file, offset, buf, count)，
+          # KernelSU-Next legacy 多处直接按 4.14+ 的 (file, buf, count, pos) 调用，
+          # 导致读 APK 签名 / packages.list / allowlist 全部失败 -> 管理器检测不到 root。
+          # 改为调用 KernelSU 自带的兼容函数。4.14+ 内核自动跳过。
+          if grep -q "ssize_t kernel_read" fs/read_write.c; then
+            echo "new kernel_read API, skip"; exit 0
+          fi
+          cd KernelSU-Next/kernel
+          files=$(grep -rlE '(^|[^_[:alnum:]])kernel_(read|write)\(' --include=*.c . | grep -v 'compat/kernel_compat\.c' || true)
+          for f in $files; do
+            sed -i -E 's/(^|[^_[:alnum:]])kernel_read\(/\1ksu_kernel_read_compat(/g; s/(^|[^_[:alnum:]])kernel_write\(/\1ksu_kernel_write_compat(/g' "$f"
+            grep -q 'compat/kernel_compat.h' "$f" || sed -i '0,/^#include/s//#include "compat\/kernel_compat.h"\n#include/' "$f"
+            echo "patched: $f"
+          done
+
       - name: Apply KernelSU-Next manual hooks
         # 4.9 内核不支持 kprobes hook (需 >=5.10) 和 syscall table hook (需 >=4.17)，
         # 只能用手动 hook。已打过的文件会自动跳过。
