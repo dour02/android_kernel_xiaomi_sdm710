@@ -8,7 +8,7 @@ env:
   # 内核对外报告的 UAPI 版本，需与管理器一致（管理器首页“管理器版本”括号里横线后的数字）。
   # legacy 最新代码是 6，已发布的管理器 v3.4.2 是 5；6 相对 5 只是新增接口，
   # 所以改报 5 即可让 v3.4.2 管理器完整工作。官方发布 UAPI 6 的管理器后改成 "6"。
-  KSU_UAPI: "5"   # 现在用 CI 版管理器 (UAPI 6)；用正式版 v3.4.2 时改成 "5"
+  KSU_UAPI: "5"   # 正式版管理器 v3.4.2 = 5；换 CI 版管理器 (UAPI 6) 时改成 "6"
 
 jobs:
   build:
@@ -66,6 +66,65 @@ jobs:
             grep -q 'compat/kernel_compat.h' "$f" || sed -i '0,/^#include/s//#include "compat\/kernel_compat.h"\n#include/' "$f"
             echo "patched: $f"
           done
+
+      - name: Fix SELinux AVC seqno for kernels without selinux_state (4.9)
+        run: |
+          # KernelSU-Next on kernels without selinux_state (4.9): after editing the policy
+          # in place it flushed the AVC with its own local seqno (2, 3, ...) while the
+          # security server kept handing out latest_granting = 1. From then on every
+          # avc_insert() is rejected ("SELinux: avc: seqno 1 < latest_notif 2"), the AVC
+          # never caches anything and the log floods. Bump the real latest_granting instead.
+          set -e
+          RULES=KernelSU-Next/kernel/selinux/rules.c
+          SS=security/selinux/ss/services.c
+
+          if ! grep -q "^static u32 latest_granting;$" "$SS"; then
+            echo "kernel has selinux_state (>= 4.14 style), KernelSU uses its seqno, skip"; exit 0
+          fi
+          if ! grep -q "static u32 ksu_avc_seqno = 1;" "$RULES"; then
+            grep -q "ksu_selinux_next_seqno" "$RULES" && { echo "already patched"; exit 0; }
+            echo "rules.c: KernelSU code changed, please re-check this fix"; exit 1
+          fi
+          grep -q "^static DEFINE_RWLOCK(policy_rwlock);$\|^DEFINE_RWLOCK(policy_rwlock);$" "$SS" || { echo "services.c: policy_rwlock not found"; exit 1; }
+
+          if ! grep -q "ksu_selinux_next_seqno" "$SS"; then
+            python3 - "$SS" <<'EOF'
+          import sys
+          p = sys.argv[1]
+          s = open(p).read()
+          helper = '''static u32 latest_granting;
+
+          #ifdef CONFIG_KSU
+          /* KernelSU-Next: hand out a real policy seqno after in-place policy edits */
+          u32 ksu_selinux_next_seqno(void)
+          {
+          	u32 seqno;
+
+          	write_lock_irq(&policy_rwlock);
+          	seqno = ++latest_granting;
+          	write_unlock_irq(&policy_rwlock);
+          	return seqno;
+          }
+          #endif
+          '''
+          s = s.replace('static u32 latest_granting;\n', helper, 1)
+          open(p, 'w').write(s)
+          EOF
+            echo "patched: $SS"
+          fi
+
+          python3 - "$RULES" <<'EOF'
+          import sys
+          p = sys.argv[1]
+          s = open(p).read()
+          old = '''	static u32 ksu_avc_seqno = 1;
+          	u32 seqno = ++ksu_avc_seqno;'''
+          new = '''	extern u32 ksu_selinux_next_seqno(void);
+          	u32 seqno = ksu_selinux_next_seqno();'''
+          assert s.count(old) == 1, 'rules.c: local seqno block not found'
+          open(p, 'w').write(s.replace(old, new))
+          EOF
+          echo "patched: $RULES"
 
       - name: Apply KernelSU-Next manual hooks
         # 4.9 内核不支持 kprobes hook (需 >=5.10) 和 syscall table hook (需 >=4.17)，
