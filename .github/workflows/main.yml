@@ -25,30 +25,114 @@ jobs:
         run: |
           git clone --depth=1 https://github.com/kdrag0n/proton-clang $HOME/tc
           echo "$HOME/tc/bin" >> $GITHUB_PATH
+          # vdso32 用 clang --prefix=<CROSS_COMPILE_ARM32 所在目录> 找 ld。
+          # proton-clang/bin 里的 "ld" 是 x86 的，会导致
+          # "unrecognised emulation mode: armelf_linux_eabi"。
+          # 所以单独建一个只含 ARM32 binutils 的目录。
+          mkdir -p $HOME/arm32
+          for f in $HOME/tc/bin/arm-linux-gnueabi-*; do ln -sf "$f" $HOME/arm32/; done
+          ln -sf $HOME/tc/bin/arm-linux-gnueabi-ld $HOME/arm32/ld
+          ln -sf $HOME/tc/bin/arm-linux-gnueabi-as $HOME/arm32/as
 
       - name: Integrate KernelSU-Next
         run: |
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s $KSU_BRANCH
 
+      - name: Apply KernelSU-Next manual hooks
+        # 4.9 内核不支持 kprobes hook (需 >=5.10) 和 syscall table hook (需 >=4.17)，
+        # 只能用手动 hook。已打过的文件会自动跳过。
+        shell: python3 {0}
+        run: |
+          import sys
+          G = '#ifdef CONFIG_KSU_MANUAL_HOOK\n'
+          E = '#endif\n'
+
+          def patch(path, anchor, decl, call, call_after, replace=None, post=''):
+              s = open(path).read()
+              if 'ksu_handle_' in s:
+                  print(f'[skip] {path} already hooked'); return
+              if anchor not in s:
+                  sys.exit(f'[FAIL] anchor not found in {path}')
+              new = G + decl + E + '\n' + anchor
+              if replace:
+                  new = new.replace(replace[0], replace[1])
+              new = new.replace(call_after, call_after + '\n' + G + call + E + post, 1)
+              s = s.replace(anchor, new, 1)
+              open(path, 'w').write(s)
+              print(f'[ok]   {path}')
+
+          # kernel/reboot.c  (KernelSU 的 Kbuild 靠这个判断 hook 是否存在)
+          patch('kernel/reboot.c',
+                'SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,\n\t\tvoid __user *, arg)\n{\n\tstruct pid_namespace *pid_ns = task_active_pid_ns(current);\n\tchar buffer[256];\n\tint ret = 0;\n',
+                'extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd,\n\t\t\t\t void __user **arg);\n',
+                '\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n',
+                '\tint ret = 0;\n')
+
+          # fs/exec.c
+          patch('fs/exec.c',
+                'static int do_execveat_common(int fd, struct filename *filename,\n\t\t\t      struct user_arg_ptr argv,\n\t\t\t      struct user_arg_ptr envp,\n\t\t\t      int flags)\n{\n\tchar *pathbuf = NULL;\n\tstruct linux_binprm *bprm;\n\tstruct file *file;\n\tstruct files_struct *displaced;\n\tint retval;\n',
+                'extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,\n\t\t\t       void *argv, void *envp, int *flags);\n',
+                '\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n',
+                '\tint retval;\n')
+
+          # fs/open.c
+          patch('fs/open.c',
+                'SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)\n{\n\tconst struct cred *old_cred;\n\tstruct cred *override_cred;\n\tstruct path path;\n\tstruct inode *inode;\n\tstruct vfsmount *mnt;\n\tint res;\n\tunsigned int lookup_flags = LOOKUP_FOLLOW;\n',
+                'extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,\n\t\t\t\tint *mode, int *flags);\n',
+                '\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n',
+                '\tunsigned int lookup_flags = LOOKUP_FOLLOW;\n')
+
+          # fs/stat.c
+          patch('fs/stat.c',
+                'int vfs_fstatat(int dfd, const char __user *filename, struct kstat *stat,\n\t\tint flag)\n{\n\tstruct path path;\n\tint error = -EINVAL;\n\tunsigned int lookup_flags = 0;\n',
+                'extern int ksu_handle_stat(int *dfd, const char __user **filename_user,\n\t\t\t   int *flags);\n',
+                '\tksu_handle_stat(&dfd, &filename, &flag);\n',
+                '\tunsigned int lookup_flags = 0;\n')
+
+          # fs/read_write.c
+          patch('fs/read_write.c',
+                'SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)\n{\n\tstruct fd f = fdget_pos(fd);\n\tssize_t ret = -EBADF;\n',
+                'extern void ksu_handle_sys_read(unsigned int fd);\n',
+                '\tksu_handle_sys_read(fd);\n',
+                '\tssize_t ret = -EBADF;\n',
+                replace=('\tstruct fd f = fdget_pos(fd);\n', '\tstruct fd f;\n'),
+                post='\tf = fdget_pos(fd);\n')
+
+          # drivers/input/input.c  (开机按音量下键进安全模式)
+          patch('drivers/input/input.c',
+                'static void input_handle_event(struct input_dev *dev,\n\t\t\t       unsigned int type, unsigned int code, int value)\n{\n\tint disposition = input_get_disposition(dev, type, code, &value);\n',
+                'extern int ksu_handle_input_handle_event(unsigned int *type,\n\t\t\t\t\t unsigned int *code, int *value);\n',
+                '\tksu_handle_input_handle_event(&type, &code, &value);\n',
+                '\tint disposition;\n',
+                replace=('\tint disposition = input_get_disposition(dev, type, code, &value);\n', '\tint disposition;\n'),
+                post='\tdisposition = input_get_disposition(dev, type, code, &value);\n')
+
+          # security/selinux/avc.c
+          patch('security/selinux/avc.c',
+                'noinline int slow_avc_audit(u32 ssid, u32 tsid, u16 tclass,\n\t\tu32 requested, u32 audited, u32 denied, int result,\n\t\tstruct common_audit_data *a,\n\t\tunsigned flags)\n{\n\tstruct common_audit_data stack_data;\n\tstruct selinux_audit_data sad;\n',
+                'extern int ksu_handle_slow_avc_audit(u32 *tsid);\n',
+                '\tksu_handle_slow_avc_audit(&tsid);\n',
+                '\tstruct selinux_audit_data sad;\n')
+
       - name: KSU config fragment
         run: |
+          # 原来的 CONFIG_KSU_KPROBE_HOOKS 这个选项根本不存在；
+          # 4.9 上只能用手动 hook，不需要 kprobes。
           printf '%s\n' \
             CONFIG_KSU=y \
-            CONFIG_KPROBES=y \
-            CONFIG_HAVE_KPROBES=y \
-            CONFIG_KPROBE_EVENTS=y \
-            CONFIG_KSU_KPROBE_HOOKS=y \
-            CONFIG_MODULES=y \
+            CONFIG_KSU_MANUAL_HOOK=y \
             > arch/arm64/configs/ksu.config
 
       - name: Build
         run: |
+          set -o pipefail
           ARGS="O=out ARCH=arm64 CC=clang LD=ld.lld \
-            CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=$HOME/arm32/arm-linux-gnueabi- \
             AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip"
           make $ARGS sdm670-perf_defconfig xiaomi/sdm710-common.config xiaomi/grus.config ksu.config
-          grep -E "CONFIG_KSU|CONFIG_KPROBES" out/.config
+          grep -E "CONFIG_KSU" out/.config
           make $ARGS -j$(nproc --all) 2>&1 | tee build.log
+          grep -q "Hook mode: Manual" build.log
           test -f out/arch/arm64/boot/Image
 
       - name: Package AnyKernel3
