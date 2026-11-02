@@ -126,81 +126,171 @@ jobs:
           EOF
           echo "patched: $RULES"
 
+      - name: Fix fscrypt keyring for ksu_cred (< 4.10)
+        run: |
+          # Kernels < 4.10 (fscrypt v1): file keys are looked up in the *current* cred's
+          # keyrings. KernelSU scans /data/app with override_creds(ksu_cred), and ksu_cred
+          # was prepared before init created its session keyring, so opening an APK whose
+          # key isn't cached yet fails ("open .../base.apk error." -> is_manager: 0).
+          # KernelSU already captures init's session keyring; also hand it to ksu_cred.
+          set -e
+          LSM=KernelSU-Next/kernel/hook/lsm_hooks.c
+          APK=KernelSU-Next/kernel/manager/apk_sign.c
+
+          if grep -q "ksu_cred->session_keyring" "$LSM"; then
+            echo "already patched"
+          else
+            python3 - "$LSM" <<'EOF'
+          import sys
+          p = sys.argv[1]
+          s = open(p).read()
+          old = '''	init_session_keyring = cred->session_keyring;
+          	pr_info("kernel_compat: got init_session_keyring\\n");'''
+          new = '''	init_session_keyring = cred->session_keyring;
+          	pr_info("kernel_compat: got init_session_keyring\\n");
+          	{
+          		/* let override_creds(ksu_cred) find fscrypt keys (fscrypt v1) */
+          		extern struct cred *ksu_cred;
+          		if (init_session_keyring && ksu_cred &&
+          		    !rcu_access_pointer(ksu_cred->session_keyring)) {
+          			rcu_assign_pointer(ksu_cred->session_keyring,
+          					   key_get(init_session_keyring));
+          			pr_info("kernel_compat: installed init session keyring to ksu_cred\\n");
+          		}
+          	}'''
+          assert s.count(old) == 1, 'lsm_hooks.c: init_session_keyring capture not found'
+          s = s.replace(old, new)
+          if '#include <linux/key.h>' not in s:
+              s = s.replace('#include <linux/lsm_hooks.h>\n', '#include <linux/lsm_hooks.h>\n#include <linux/key.h>\n#include <linux/cred.h>\n', 1)
+          open(p, 'w').write(s)
+          EOF
+            echo "patched: $LSM"
+          fi
+
+          # print the errno when an APK can't be opened
+          if grep -q 'pr_err("open %s error.\\n", path);' "$APK"; then
+            sed -i 's|pr_err("open %s error.\\n", path);|pr_err("open %s error: %ld\\n", path, PTR_ERR(fp));|' "$APK"
+            echo "patched: $APK"
+          fi
+
       - name: Apply KernelSU-Next manual hooks
         # 4.9 内核不支持 kprobes hook (需 >=5.10) 和 syscall table hook (需 >=4.17)，
         # 只能用手动 hook。已打过的文件会自动跳过。
         shell: python3 {0}
         run: |
-          import sys
+          #!/usr/bin/env python3
+          # KernelSU-Next manual hooks for non-GKI kernels (tested on 4.9 and 4.14).
+          # Run from the kernel source root. Already-hooked files are skipped.
+          import re, sys
+
           G = '#ifdef CONFIG_KSU_MANUAL_HOOK\n'
           E = '#endif\n'
+          failed = []
 
-          def patch(path, anchor, decl, call, call_after, replace=None, post=''):
-              s = open(path).read()
-              if 'ksu_handle_' in s:
-                  print(f'[skip] {path} already hooked'); return
-              if anchor not in s:
-                  sys.exit(f'[FAIL] anchor not found in {path}')
-              new = G + decl + E + '\n' + anchor
-              if replace:
-                  new = new.replace(replace[0], replace[1])
-              new = new.replace(call_after, call_after + '\n' + G + call + E + post, 1)
-              s = s.replace(anchor, new, 1)
+          def body_span(s, header_re):
+              m = re.search(header_re, s, re.M)
+              if not m:
+                  return None
+              start = s.index('{', m.end() - 1) + 1
+              return m.start(), start
+
+          def hook(path, header_re, decl, after_re, call, init_fix=None, marker='ksu_handle_'):
+              try:
+                  s = open(path).read()
+              except FileNotFoundError:
+                  failed.append(f'{path}: file not found'); return
+              if marker in s:
+                  print(f'[skip] {path}: already hooked'); return
+              span = body_span(s, header_re)
+              if not span:
+                  failed.append(f'{path}: function not found ({header_re})'); return
+              fstart, bstart = span
+              body = s[bstart:bstart + 3000]
+              post = ''
+              if init_fix:
+                  # split "type var = expr;" into "type var;" + hook + "var = expr;"
+                  m = re.search(init_fix, body, re.M)
+                  if not m:
+                      failed.append(f'{path}: initializer not found ({init_fix})'); return
+                  body = body[:m.start()] + m.group('decl') + ';\n' + body[m.end():]
+                  post = '\t' + m.group('var') + ' = ' + m.group('expr') + ';\n'
+              m = re.search(after_re, body, re.M)
+              if not m:
+                  failed.append(f'{path}: insertion point not found ({after_re})'); return
+              body = body[:m.end()] + '\n' + G + call + E + post + body[m.end():]
+              s = s[:fstart] + G + decl + E + '\n' + s[fstart:bstart] + body + s[bstart + 3000:]
               open(path, 'w').write(s)
               print(f'[ok]   {path}')
 
-          # kernel/reboot.c  (KernelSU 的 Kbuild 靠这个判断 hook 是否存在)
-          patch('kernel/reboot.c',
-                'SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,\n\t\tvoid __user *, arg)\n{\n\tstruct pid_namespace *pid_ns = task_active_pid_ns(current);\n\tchar buffer[256];\n\tint ret = 0;\n',
-                'extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd,\n\t\t\t\t void __user **arg);\n',
-                '\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n',
-                '\tint ret = 0;\n')
+          # Last local declaration line before the first statement
+          LAST_DECL = r'^\t[^\n]*;\n(?=\n)'
 
-          # fs/exec.c
-          patch('fs/exec.c',
-                'static int do_execveat_common(int fd, struct filename *filename,\n\t\t\t      struct user_arg_ptr argv,\n\t\t\t      struct user_arg_ptr envp,\n\t\t\t      int flags)\n{\n\tchar *pathbuf = NULL;\n\tstruct linux_binprm *bprm;\n\tstruct file *file;\n\tstruct files_struct *displaced;\n\tint retval;\n',
-                'extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,\n\t\t\t       void *argv, void *envp, int *flags);\n',
-                '\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n',
-                '\tint retval;\n')
+          hook('kernel/reboot.c',
+               r'^SYSCALL_DEFINE4\(reboot,[^{]*\{',
+               'extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd,\n\t\t\t\t void __user **arg);\n',
+               LAST_DECL,
+               '\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n')
 
-          # fs/open.c
-          patch('fs/open.c',
-                'SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)\n{\n\tconst struct cred *old_cred;\n\tstruct cred *override_cred;\n\tstruct path path;\n\tstruct inode *inode;\n\tstruct vfsmount *mnt;\n\tint res;\n\tunsigned int lookup_flags = LOOKUP_FOLLOW;\n',
-                'extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,\n\t\t\t\tint *mode, int *flags);\n',
-                '\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n',
-                '\tunsigned int lookup_flags = LOOKUP_FOLLOW;\n')
+          hook('fs/exec.c',
+               r'^static int do_execveat_common\(int fd, struct filename \*filename,[^{]*\{',
+               'extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,\n\t\t\t       void *argv, void *envp, int *flags);\n',
+               LAST_DECL,
+               '\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n')
 
-          # fs/stat.c
-          patch('fs/stat.c',
-                'int vfs_fstatat(int dfd, const char __user *filename, struct kstat *stat,\n\t\tint flag)\n{\n\tstruct path path;\n\tint error = -EINVAL;\n\tunsigned int lookup_flags = 0;\n',
-                'extern int ksu_handle_stat(int *dfd, const char __user **filename_user,\n\t\t\t   int *flags);\n',
-                '\tksu_handle_stat(&dfd, &filename, &flag);\n',
-                '\tunsigned int lookup_flags = 0;\n')
+          hook('fs/open.c',
+               r'^(SYSCALL_DEFINE3\(faccessat, int, dfd|long do_faccessat\(int dfd)[^{]*\{',
+               'extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,\n\t\t\t\tint *mode, int *flags);\n',
+               LAST_DECL,
+               '\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n')
 
-          # fs/read_write.c
-          patch('fs/read_write.c',
-                'SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)\n{\n\tstruct fd f = fdget_pos(fd);\n\tssize_t ret = -EBADF;\n',
-                'extern void ksu_handle_sys_read(unsigned int fd);\n',
-                '\tksu_handle_sys_read(fd);\n',
-                '\tssize_t ret = -EBADF;\n',
-                replace=('\tstruct fd f = fdget_pos(fd);\n', '\tstruct fd f;\n'),
-                post='\tf = fdget_pos(fd);\n')
+          # 4.11+: vfs_statx(dfd, filename, flags, ...); older: vfs_fstatat(dfd, filename, stat, flag)
+          _s = open('fs/stat.c').read()
+          if re.search(r'^int vfs_statx\(int dfd, const char __user \*filename, int flags,', _s, re.M):
+              hook('fs/stat.c',
+                   r'^int vfs_statx\(int dfd, const char __user \*filename, int flags,[^{]*\{',
+                   'extern int ksu_handle_stat(int *dfd, const char __user **filename_user,\n\t\t\t   int *flags);\n',
+                   LAST_DECL,
+                   '\tksu_handle_stat(&dfd, &filename, &flags);\n')
+          else:
+              hook('fs/stat.c',
+                   r'^int vfs_fstatat\(int dfd, const char __user \*filename,[^{]*\{',
+                   'extern int ksu_handle_stat(int *dfd, const char __user **filename_user,\n\t\t\t   int *flags);\n',
+                   LAST_DECL,
+                   '\tksu_handle_stat(&dfd, &filename, &flag);\n')
 
-          # drivers/input/input.c  (开机按音量下键进安全模式)
-          patch('drivers/input/input.c',
-                'static void input_handle_event(struct input_dev *dev,\n\t\t\t       unsigned int type, unsigned int code, int value)\n{\n\tint disposition = input_get_disposition(dev, type, code, &value);\n',
-                'extern int ksu_handle_input_handle_event(unsigned int *type,\n\t\t\t\t\t unsigned int *code, int *value);\n',
-                '\tksu_handle_input_handle_event(&type, &code, &value);\n',
-                '\tint disposition;\n',
-                replace=('\tint disposition = input_get_disposition(dev, type, code, &value);\n', '\tint disposition;\n'),
-                post='\tdisposition = input_get_disposition(dev, type, code, &value);\n')
+          hook('fs/read_write.c',
+               r'^SYSCALL_DEFINE3\(read, unsigned int, fd,[^{]*\{',
+               'extern void ksu_handle_sys_read(unsigned int fd);\n',
+               LAST_DECL,
+               '\tksu_handle_sys_read(fd);\n',
+               init_fix=r'^(?P<decl>\tstruct fd (?P<var>f)) = (?P<expr>fdget_pos\(fd\));\n')
 
-          # security/selinux/avc.c
-          patch('security/selinux/avc.c',
-                'noinline int slow_avc_audit(u32 ssid, u32 tsid, u16 tclass,\n\t\tu32 requested, u32 audited, u32 denied, int result,\n\t\tstruct common_audit_data *a,\n\t\tunsigned flags)\n{\n\tstruct common_audit_data stack_data;\n\tstruct selinux_audit_data sad;\n',
-                'extern int ksu_handle_slow_avc_audit(u32 *tsid);\n',
-                '\tksu_handle_slow_avc_audit(&tsid);\n',
-                '\tstruct selinux_audit_data sad;\n')
+          hook('drivers/input/input.c',
+               r'^static void input_handle_event\(struct input_dev \*dev,[^{]*\{',
+               'extern int ksu_handle_input_handle_event(unsigned int *type,\n\t\t\t\t\t unsigned int *code, int *value);\n',
+               LAST_DECL,
+               '\tksu_handle_input_handle_event(&type, &code, &value);\n',
+               init_fix=r'^(?P<decl>\tint (?P<var>disposition)) = (?P<expr>input_get_disposition\(dev, type, code, &value\));\n')
+
+          hook('security/selinux/avc.c',
+               r'^noinline int slow_avc_audit\([^{]*\{',
+               'extern int ksu_handle_slow_avc_audit(u32 *tsid);\n',
+               LAST_DECL,
+               '\tksu_handle_slow_avc_audit(&tsid);\n')
+
+          # nosuid /data: 4.9 (and 4.14 without nosuid_transition) only allows exec domain
+          # transitions to bounded types, so init can't start /data/adb/ksud as u:r:ksu:s0
+          # ("security_bounded_transition seresult=denied ... newcontext=u:r:ksu:s0").
+          hook('security/selinux/hooks.c',
+               r'^static int check_nnp_nosuid\(const struct linux_binprm \*bprm,[^{]*\{',
+               'extern bool is_ksu_transition(const struct task_security_struct *old_tsec,\n\t\t\t      const struct task_security_struct *new_tsec);\n',
+               r'^\t\treturn 0; /\* No change in credentials \*/\n',
+               '\tif (is_ksu_transition(old_tsec, new_tsec))\n\t\treturn 0;\n',
+               marker='is_ksu_transition')
+
+          if failed:
+              print('\n[FAIL] could not apply hooks:\n  ' + '\n  '.join(failed))
+              sys.exit(1)
 
       - name: KSU config fragment
         run: |
