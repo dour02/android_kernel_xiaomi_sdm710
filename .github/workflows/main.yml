@@ -5,6 +5,10 @@ on:
 
 env:
   KSU_BRANCH: legacy
+  # 内核对外报告的 UAPI 版本，需与管理器一致（管理器首页“管理器版本”括号里横线后的数字）。
+  # legacy 最新代码是 6，已发布的管理器 v3.4.2 是 5；6 相对 5 只是新增接口，
+  # 所以改报 5 即可让 v3.4.2 管理器完整工作。官方发布 UAPI 6 的管理器后改成 "6"。
+  KSU_UAPI: "6"   # 现在用 CI 版管理器 (UAPI 6)；用正式版 v3.4.2 时改成 "5"
 
 jobs:
   build:
@@ -37,6 +41,14 @@ jobs:
       - name: Integrate KernelSU-Next
         run: |
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s $KSU_BRANCH
+          # 让内核报告的 UAPI 版本与管理器一致（只在当前值为 6 时修改，代码变了会报错提醒）
+          H=KernelSU-Next/uapi/supercall.h
+          grep -E "^#define KERNEL_SU_UAPI_VERSION [0-9]+$" $H
+          if [ "$KSU_UAPI" != "$(grep -oE "^#define KERNEL_SU_UAPI_VERSION [0-9]+$" $H | grep -oE "[0-9]+$")" ]; then
+            grep -q "^#define KERNEL_SU_UAPI_VERSION 6$" $H
+            sed -i "s/^#define KERNEL_SU_UAPI_VERSION 6$/#define KERNEL_SU_UAPI_VERSION $KSU_UAPI/" $H
+          fi
+          grep -E "^#define KERNEL_SU_UAPI_VERSION $KSU_UAPI$" $H
 
       - name: Fix KernelSU-Next for old kernel_read API (<= 4.13)
         run: |
@@ -135,9 +147,11 @@ jobs:
         run: |
           # 原来的 CONFIG_KSU_KPROBE_HOOKS 这个选项根本不存在；
           # 4.9 上只能用手动 hook，不需要 kprobes。
+          # LOG_BUF_SHIFT=20: 内核日志缓冲区 128KB -> 1MB，开机日志不会被很快冲掉，方便排查。
           printf '%s\n' \
             CONFIG_KSU=y \
             CONFIG_KSU_MANUAL_HOOK=y \
+            CONFIG_LOG_BUF_SHIFT=20 \
             > arch/arm64/configs/ksu.config
 
       - name: Build
