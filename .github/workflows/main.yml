@@ -67,6 +67,120 @@ jobs:
             echo "patched: $f"
           done
 
+      - name: Fix KernelSU-Next for old kernel APIs (copy_to_iter, ALIGN_DOWN)
+        run: |
+          # KernelSU-Next legacy uses a few kernel APIs that changed after 4.4.
+          # Each fix only applies when the kernel has the old form; newer kernels skip.
+          set -e
+          K=KernelSU-Next/kernel
+
+          # 1) copy_to_iter(void *addr, ...) without const (e.g. 4.4):
+          #    passing the const init.rc string -> -Werror discards qualifiers
+          F=$K/runtime/ksud_integration.c
+          if grep -q "^size_t copy_to_iter(void \*addr" include/linux/uio.h; then
+            if ! grep -q "copy_to_iter((void \*)(KERNEL_SU_RC + ksu_rc_pos)" "$F"; then
+              grep -q "copy_to_iter(KERNEL_SU_RC + ksu_rc_pos," "$F" || { echo "$F: copy_to_iter call not found"; exit 1; }
+              sed -i 's/copy_to_iter(KERNEL_SU_RC + ksu_rc_pos,/copy_to_iter((void *)(KERNEL_SU_RC + ksu_rc_pos),/' "$F"
+              echo "patched copy_to_iter: $F"
+            fi
+          else
+            echo "copy_to_iter takes const, skip"
+          fi
+
+          # 2) ALIGN_DOWN() only exists since 4.15
+          if ! grep -rq "define ALIGN_DOWN" include/linux/kernel.h include/linux/align.h 2>/dev/null; then
+            for f in $(grep -rl "ALIGN_DOWN(" $K --include=*.c); do
+              grep -q "KSU_COMPAT_ALIGN_DOWN" "$f" && continue
+              # insert after the last #include of the file
+              python3 - "$f" <<'EOF'
+          import sys, re
+          p = sys.argv[1]
+          s = open(p).read()
+          last = list(re.finditer(r'^#include[^\n]*\n', s, re.M))[-1]
+          add = ('\n#ifndef ALIGN_DOWN /* KSU_COMPAT_ALIGN_DOWN: added in 4.15 */\n'
+                 '#define ALIGN_DOWN(x, a) __ALIGN_KERNEL((x) - ((a) - 1), (a))\n'
+                 '#endif\n')
+          s = s[:last.end()] + add + s[last.end():]
+          open(p, 'w').write(s)
+          EOF
+              echo "patched ALIGN_DOWN: $f"
+            done
+          else
+            echo "kernel has ALIGN_DOWN, skip"
+          fi
+
+      - name: Fix KernelSU-Next argv/path reads in manual hooks (second_stage detection)
+        run: |
+          # Manual hooks run inside the calling task's own syscall (execve / faccessat /
+          # stat), where page faults are fine. KernelSU still reads the user strings with
+          # strncpy_from_user_nofault(), which fails if the page holding the string isn't
+          # resident yet. init's "second_stage" argument is a string literal in a page
+          # the process never touched, so the read fails, "second_stage executed" is
+          # never detected, KernelSU's SELinux rules / ksu_cred are never set up and the
+          # manager is never recognised ("exec zygote ... second_stage: 0").
+          # Use a faulting read (same return convention) for manual-hook builds only;
+          # kprobe builds run these in atomic context and keep the _nofault version.
+          set -e
+          K=KernelSU-Next/kernel
+
+          patch_file() {
+            f="$1"; shift
+            if grep -q "KSU_FAULTABLE_STRNCPY" "$f"; then
+              echo "already patched: $f"; return 0
+            fi
+            python3 - "$f" "$@" <<'EOF'
+          import sys, re
+          p, olds = sys.argv[1], sys.argv[2:]
+          s = open(p).read()
+          for old in olds:
+              assert s.count(old) == 1, f'{p}: not found exactly once: {old}'
+              s = s.replace(old, old.replace('strncpy_from_user_nofault(', 'ksu_strncpy_user_faultable('))
+          helper = r'''
+          /* KSU_FAULTABLE_STRNCPY: see fix_argv_fault.sh */
+          #ifndef KSU_KPROBES_HOOK
+          static inline long ksu_strncpy_user_faultable(char *dst,
+          		const void __user *src, long count)
+          {
+          	long ret;
+
+          	if (unlikely(count <= 0))
+          		return 0;
+          	ret = strncpy_from_user(dst, src, count);
+          	if (ret >= count) {
+          		ret = count;
+          		dst[ret - 1] = '\0';
+          	} else if (ret >= 0) {
+          		ret++;	/* include the NUL, like strncpy_from_user_nofault() */
+          	}
+          	return ret;
+          }
+          #else
+          #define ksu_strncpy_user_faultable strncpy_from_user_nofault
+          #endif
+          '''
+          last = list(re.finditer(r'^#include[^\n]*\n', s, re.M))[-1]
+          s = s[:last.end()] + helper + s[last.end():]
+          open(p, 'w').write(s)
+          EOF
+            echo "patched: $f"
+          }
+
+          patch_file $K/runtime/ksud_integration.c \
+            "	if (strncpy_from_user_nofault(buf, p, buf_len) <= 0)" \
+            "					if (strncpy_from_user_nofault(env, p, sizeof(env)) < 0)"
+
+          patch_file $K/feature/sucompat.c \
+            "	memset(path, 0, sizeof(path));
+          	strncpy_from_user_nofault(path, *filename_user, sizeof(path));
+
+          	if (unlikely(!memcmp(path, su, sizeof(su)))) {
+          		ksu_compat_sulog('a');" \
+            "	memset(path, 0, sizeof(path));
+          	strncpy_from_user_nofault(path, *filename_user, sizeof(path));
+
+          	if (unlikely(!memcmp(path, su, sizeof(su)))) {
+          		ksu_compat_sulog('s');"
+
       - name: Fix SELinux AVC seqno for kernels without selinux_state (4.9)
         run: |
           # KernelSU-Next on kernels without selinux_state (4.9): after editing the policy
@@ -210,10 +324,12 @@ jobs:
               if init_fix:
                   # split "type var = expr;" into "type var;" + hook + "var = expr;"
                   m = re.search(init_fix, body, re.M)
-                  if not m:
-                      failed.append(f'{path}: initializer not found ({init_fix})'); return
-                  body = body[:m.start()] + m.group('decl') + ';\n' + body[m.end():]
-                  post = '\t' + m.group('var') + ' = ' + m.group('expr') + ';\n'
+                  if m:
+                      body = body[:m.start()] + m.group('decl') + ';\n' + body[m.end():]
+                      post = '\t' + m.group('var') + ' = ' + m.group('expr') + ';\n'
+                  # else: older kernels (e.g. 4.4 input.c) already declare the variable
+                  # and assign it in a separate statement after the declarations, so
+                  # inserting right after the declarations is still before its first use
               m = re.search(after_re, body, re.M)
               if not m:
                   failed.append(f'{path}: insertion point not found ({after_re})'); return
